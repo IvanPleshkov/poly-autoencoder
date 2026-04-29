@@ -1,0 +1,8 @@
+cache/
+*.npy
+*.hdf5
+*.pyc
+__pycache__/
+.venv/
+venv/
+*.txt.cache
