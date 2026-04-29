@@ -1,7 +1,6 @@
 # Polynomial Autoencoder for Embeddings
 
-Reference implementation for the post **"Полиномиальный автоэнкодер для
-эмбеддингов"**: a closed-form autoencoder with **linear encoder** (top-d
+Reference implementation for the post [**"A polynomial autoencoder beats PCA on transformer embeddings"**](https://first-post-personal-site.pleshkov-ivan.workers.dev/blog/polynomial-autoencoder/): a closed-form autoencoder with **linear encoder** (top-d
 PCA) and **quadratic decoder** (polynomial lift over the PCA coordinate
 + Ridge OLS). No SGD: both encoder and decoder are closed-form. Evaluated
 on eight embeddings (transformer text, CNN images, word vectors,
