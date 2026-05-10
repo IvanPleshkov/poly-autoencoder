@@ -61,7 +61,16 @@ CACHE_DIR = Path(__file__).parent / "cache"
 def _download(url: str, dest: Path) -> None:
     print(f"[beir] downloading {url} -> {dest}")
     dest.parent.mkdir(parents=True, exist_ok=True)
-    with urllib.request.urlopen(url) as r, open(dest, "wb") as f:
+    # Windows often lacks system CA roots that match the BEIR mirror cert;
+    # fall back to certifi's bundle if it is installed (always is, since it
+    # comes in via huggingface_hub).
+    try:
+        import ssl
+        import certifi
+        ctx = ssl.create_default_context(cafile=certifi.where())
+    except ImportError:
+        ctx = None
+    with urllib.request.urlopen(url, context=ctx) as r, open(dest, "wb") as f:
         while chunk := r.read(1 << 20):
             f.write(chunk)
 
@@ -233,7 +242,12 @@ def encode_corpus(model_name: str, dataset_name: str,
 
     from sentence_transformers import SentenceTransformer
     import torch
-    device = "mps" if torch.backends.mps.is_available() else "cpu"
+    if torch.cuda.is_available():
+        device = "cuda"
+    elif torch.backends.mps.is_available():
+        device = "mps"
+    else:
+        device = "cpu"
     print(f"[encode] loading model {spec['hf']} on {device}")
     kwargs = {}
     if spec["trust_remote_code"]:
@@ -300,6 +314,31 @@ def retrieve_pca(Vq: np.ndarray, Vc: np.ndarray, d: int):
     return _topk_scores(_l2_normalize(Pq), _l2_normalize(Pc))
 
 
+def retrieve_pca_whitened(Vq: np.ndarray, Vc: np.ndarray, d: int):
+    """PCA + per-axis std normalization (full whitening). Retrieve cosine in
+    d-dim whitened PCA space. Each axis gets unit variance, so the cosine
+    similarity weighs every direction equally rather than letting top
+    eigendirections dominate.
+    """
+    stats = fit_pca(Vc, d)
+    inv_sqrt = (1.0 / np.sqrt(stats.eigvals)).astype(np.float32)
+    Pc = ((Vc - stats.mean) @ stats.Q) * inv_sqrt
+    Pq = ((Vq - stats.mean) @ stats.Q) * inv_sqrt
+    return _topk_scores(_l2_normalize(Pq), _l2_normalize(Pc))
+
+
+def retrieve_pca_halfwhitened(Vq: np.ndarray, Vc: np.ndarray, d: int):
+    """PCA + half whitening: divide each axis by eigvals^(1/4). Compromise
+    between raw PCA (axes weighted by eigval) and full whitening (equal
+    weight). Equivalent to taking the geometric mean of the two metrics.
+    """
+    stats = fit_pca(Vc, d)
+    inv_quart = (1.0 / np.power(stats.eigvals, 0.25)).astype(np.float32)
+    Pc = ((Vc - stats.mean) @ stats.Q) * inv_quart
+    Pq = ((Vq - stats.mean) @ stats.Q) * inv_quart
+    return _topk_scores(_l2_normalize(Pq), _l2_normalize(Pc))
+
+
 def retrieve_poly(Vq: np.ndarray, Vc: np.ndarray, d: int,
                   lam: float = 1e-3) -> Tuple[np.ndarray, np.ndarray]:
     """Polynomial autoencoder: PCA -> quad lift -> ridge -> V_hat in D-dim.
@@ -309,6 +348,44 @@ def retrieve_poly(Vq: np.ndarray, Vc: np.ndarray, d: int,
     stats = fit_pca(Vc, d)
     Pc = project(Vc, stats)
     Pq = project(Vq, stats)
+    Lc = polynomial_lift(Pc, degree=2)
+    W = fit_ridge(Lc, Vc, lam=lam)
+    Lq = polynomial_lift(Pq, degree=2)
+    Vc_hat = Lc @ W
+    Vq_hat = Lq @ W
+    return _topk_scores(_l2_normalize(Vq_hat), _l2_normalize(Vc_hat))
+
+
+def retrieve_poly_nowhitening(Vq: np.ndarray, Vc: np.ndarray, d: int,
+                              lam: float = 1e-3,
+                              ball_radius: float = 0.9
+                              ) -> Tuple[np.ndarray, np.ndarray]:
+    """Poly autoencoder *without* per-axis whitening of the PCA latent.
+
+    Project to PCA top-d, keep raw eigvalue-weighted axes (no division by
+    sqrt(eigvals)), apply only a global scale so ‖p‖ ≤ ball_radius for
+    numerical stability of the squared lift. Then quad lift + ridge as
+    before, retrieve on V_hat.
+
+    The point of this variant is to isolate whether the per-axis whitening
+    inside poly-AE is load-bearing for retrieval, or whether the quadratic
+    decoder alone is enough.
+    """
+    mean = Vc.mean(axis=0).astype(np.float32)
+    Vc_centered = Vc - mean
+    cov = (Vc_centered.T @ Vc_centered) / len(Vc)
+    eigvals_full, U_full = np.linalg.eigh(cov.astype(np.float64))
+    Q = U_full[:, ::-1][:, :d].astype(np.float32)
+
+    Pc = Vc_centered @ Q
+    Pq = (Vq - mean) @ Q
+
+    # transductive global scale on corpus only — queries inherit
+    max_norm = float(np.linalg.norm(Pc, axis=1).max())
+    scale = (ball_radius / max_norm) if max_norm > 0 else 1.0
+    Pc = (Pc * scale).astype(np.float32)
+    Pq = (Pq * scale).astype(np.float32)
+
     Lc = polynomial_lift(Pc, degree=2)
     W = fit_ridge(Lc, Vc, lam=lam)
     Lq = polynomial_lift(Pq, degree=2)
@@ -366,9 +443,14 @@ class MethodResult:
     notes: str = ""
 
 
+ALL_METHODS = ("raw", "matryoshka", "pca", "pca-whitened", "pca-halfwhitened",
+               "poly", "poly-nowhitening")
+
+
 def run(model_name: str, dataset_name: str, d: int,
+        methods: Tuple[str, ...] = ALL_METHODS,
         ks: Tuple[int, ...] = (10,)) -> List[MethodResult]:
-    print(f"[run] {model_name} on {dataset_name}, d={d}")
+    print(f"[run] {model_name} on {dataset_name}, d={d}, methods={methods}")
     corpus_ids, corpus_texts, query_ids, query_texts, qrels = load_beir(dataset_name)
     print(f"[run] corpus={len(corpus_texts)}, queries={len(query_texts)}, "
           f"qrels={sum(len(v) for v in qrels.values())}")
@@ -380,18 +462,19 @@ def run(model_name: str, dataset_name: str, d: int,
     spec = MODELS[model_name]
     results: List[MethodResult] = []
 
-    print("[run] retrieve: raw")
-    t0 = time.time()
-    idx, _ = retrieve_raw(Vq, Vc)
-    results.append(MethodResult(
-        method=f"raw ({D}d)",
-        ndcg10=ndcg_at_k(qrels, query_ids, corpus_ids, idx, None, 10),
-        recall10=recall_at_k(qrels, query_ids, corpus_ids, idx, 10),
-        bytes_per_vec=D * 2,  # fp16
-    ))
-    print(f"  done in {time.time()-t0:.1f}s")
+    if "raw" in methods:
+        print("[run] retrieve: raw")
+        t0 = time.time()
+        idx, _ = retrieve_raw(Vq, Vc)
+        results.append(MethodResult(
+            method=f"raw ({D}d)",
+            ndcg10=ndcg_at_k(qrels, query_ids, corpus_ids, idx, None, 10),
+            recall10=recall_at_k(qrels, query_ids, corpus_ids, idx, 10),
+            bytes_per_vec=D * 2,  # fp16
+        ))
+        print(f"  done in {time.time()-t0:.1f}s")
 
-    if spec["matryoshka"] and d < D:
+    if "matryoshka" in methods and spec["matryoshka"] and d < D:
         print(f"[run] retrieve: matryoshka top-{d}")
         t0 = time.time()
         idx, _ = retrieve_matryoshka(Vq, Vc, d)
@@ -403,29 +486,69 @@ def run(model_name: str, dataset_name: str, d: int,
         ))
         print(f"  done in {time.time()-t0:.1f}s")
 
-    print(f"[run] retrieve: PCA top-{d}")
-    t0 = time.time()
-    idx, _ = retrieve_pca(Vq, Vc, d)
-    results.append(MethodResult(
-        method=f"PCA ({d}d)",
-        ndcg10=ndcg_at_k(qrels, query_ids, corpus_ids, idx, None, 10),
-        recall10=recall_at_k(qrels, query_ids, corpus_ids, idx, 10),
-        bytes_per_vec=d * 2,
-    ))
-    print(f"  done in {time.time()-t0:.1f}s")
+    if "pca" in methods:
+        print(f"[run] retrieve: PCA top-{d}")
+        t0 = time.time()
+        idx, _ = retrieve_pca(Vq, Vc, d)
+        results.append(MethodResult(
+            method=f"PCA ({d}d)",
+            ndcg10=ndcg_at_k(qrels, query_ids, corpus_ids, idx, None, 10),
+            recall10=recall_at_k(qrels, query_ids, corpus_ids, idx, 10),
+            bytes_per_vec=d * 2,
+        ))
+        print(f"  done in {time.time()-t0:.1f}s")
 
-    M = lift_dim(d)
-    print(f"[run] retrieve: poly autoencoder d={d} (M={M} lift features)")
-    t0 = time.time()
-    idx, _ = retrieve_poly(Vq, Vc, d)
-    results.append(MethodResult(
-        method=f"poly-AE ({d}d -> {D}d V_hat)",
-        ndcg10=ndcg_at_k(qrels, query_ids, corpus_ids, idx, None, 10),
-        recall10=recall_at_k(qrels, query_ids, corpus_ids, idx, 10),
-        bytes_per_vec=d * 2,
-        notes=f"M={M}",
-    ))
-    print(f"  done in {time.time()-t0:.1f}s")
+    if "pca-whitened" in methods:
+        print(f"[run] retrieve: PCA-whitened top-{d}")
+        t0 = time.time()
+        idx, _ = retrieve_pca_whitened(Vq, Vc, d)
+        results.append(MethodResult(
+            method=f"PCA-whitened ({d}d)",
+            ndcg10=ndcg_at_k(qrels, query_ids, corpus_ids, idx, None, 10),
+            recall10=recall_at_k(qrels, query_ids, corpus_ids, idx, 10),
+            bytes_per_vec=d * 2,
+        ))
+        print(f"  done in {time.time()-t0:.1f}s")
+
+    if "pca-halfwhitened" in methods:
+        print(f"[run] retrieve: PCA-half-whitened top-{d}")
+        t0 = time.time()
+        idx, _ = retrieve_pca_halfwhitened(Vq, Vc, d)
+        results.append(MethodResult(
+            method=f"PCA-halfwhitened ({d}d)",
+            ndcg10=ndcg_at_k(qrels, query_ids, corpus_ids, idx, None, 10),
+            recall10=recall_at_k(qrels, query_ids, corpus_ids, idx, 10),
+            bytes_per_vec=d * 2,
+        ))
+        print(f"  done in {time.time()-t0:.1f}s")
+
+    if "poly" in methods:
+        M = lift_dim(d)
+        print(f"[run] retrieve: poly autoencoder d={d} (M={M} lift features)")
+        t0 = time.time()
+        idx, _ = retrieve_poly(Vq, Vc, d)
+        results.append(MethodResult(
+            method=f"poly-AE ({d}d -> {D}d V_hat)",
+            ndcg10=ndcg_at_k(qrels, query_ids, corpus_ids, idx, None, 10),
+            recall10=recall_at_k(qrels, query_ids, corpus_ids, idx, 10),
+            bytes_per_vec=d * 2,
+            notes=f"M={M}",
+        ))
+        print(f"  done in {time.time()-t0:.1f}s")
+
+    if "poly-nowhitening" in methods:
+        M = lift_dim(d)
+        print(f"[run] retrieve: poly autoencoder (no whitening) d={d} (M={M})")
+        t0 = time.time()
+        idx, _ = retrieve_poly_nowhitening(Vq, Vc, d)
+        results.append(MethodResult(
+            method=f"poly-AE-nw ({d}d -> {D}d V_hat)",
+            ndcg10=ndcg_at_k(qrels, query_ids, corpus_ids, idx, None, 10),
+            recall10=recall_at_k(qrels, query_ids, corpus_ids, idx, 10),
+            bytes_per_vec=d * 2,
+            notes=f"M={M}",
+        ))
+        print(f"  done in {time.time()-t0:.1f}s")
 
     return results
 
@@ -457,10 +580,14 @@ def main() -> None:
     parser.add_argument("--dataset", required=True, choices=list(BEIR_DATASETS))
     parser.add_argument("--d", type=str, default="256",
                         help="comma-separated latent dims for matryoshka/PCA/poly")
+    parser.add_argument("--methods", type=str, default=",".join(ALL_METHODS),
+                        help="comma-separated subset of "
+                             + ",".join(ALL_METHODS))
     args = parser.parse_args()
     ds = [int(x) for x in args.d.split(",")]
+    methods = tuple(m.strip() for m in args.methods.split(","))
     for d in ds:
-        results = run(args.model, args.dataset, d)
+        results = run(args.model, args.dataset, d, methods=methods)
         print_table(args.model, args.dataset, d, results)
 
 
